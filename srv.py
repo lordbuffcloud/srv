@@ -33,7 +33,7 @@ class AsciiArt:
     @staticmethod
     def get_banner():
         try:
-            text_art = pyfiglet.figlet_format("SRV", font="cosmic")
+            text_art = pyfiglet.figlet_format("SRV.GLXY", font="cosmic")
             width = max(len(line) for line in text_art.split('\n'))
             stars = "✧ " * (width // 4)
             
@@ -57,52 +57,112 @@ class Service:
         self.process = None
         self.pid = None
         self.status = "stopped"
-        self._find_running_process()  # Check if process is already running on init
+        self._find_running_process()
 
     def _find_running_process(self):
-        """Find if this service is already running by checking process names"""
+        """Find if this service is already running by checking process names and working directory"""
         try:
-            # Get the base command name (without arguments)
             base_command = self.command.split()[0]
             base_name = os.path.basename(base_command)
+            expected_dir = os.path.normpath(os.path.expanduser(self.directory)) if self.directory else None
 
-            # Check all running processes
-            for proc in psutil.process_iter(['name', 'pid', 'cmdline']):
+            for proc in psutil.process_iter(['name', 'pid', 'cmdline', 'status', 'cwd']):
                 try:
+                    # Skip invalid processes
+                    if (proc.status() == psutil.STATUS_ZOMBIE or 
+                        not proc.is_running()):
+                        continue
+
+                    cmdline = proc.cmdline()
+                    if not cmdline:
+                        continue
+
+                    # Check working directory if specified
+                    if expected_dir:
+                        try:
+                            proc_cwd = os.path.normpath(proc.cwd())
+                            if proc_cwd != expected_dir:
+                                continue
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+
                     # For Python scripts
                     if base_name.endswith('.py'):
-                        if 'python' in proc.name().lower() and any(base_name in cmd for cmd in proc.cmdline()):
+                        if ('python' in proc.name().lower() and 
+                            any(base_name == os.path.basename(cmd) for cmd in cmdline)):
                             self.pid = proc.pid
                             self.status = "running"
                             return
                     # For executables
-                    elif base_name.lower() in proc.name().lower():
+                    elif base_name.lower() == proc.name().lower():
                         self.pid = proc.pid
                         self.status = "running"
                         return
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
+            
+            self.pid = None
+            self.status = "stopped"
+
         except Exception as e:
             console.print(f"Error checking process status for {self.name}: {str(e)}", style=ERROR_STYLE)
+            self.pid = None
+            self.status = "stopped"
 
     def is_running(self):
         """Check if the service is currently running"""
         if self.pid is None:
             return False
+            
         try:
             process = psutil.Process(self.pid)
-            # Check if process is running and responsive
-            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
-                # Verify it's the correct process
+            
+            if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                self.pid = None
+                return False
+
+            try:
+                cmdline = process.cmdline()
+                if not cmdline:
+                    self.pid = None
+                    return False
+
+                # Verify working directory if specified
+                if self.directory:
+                    expected_dir = os.path.normpath(os.path.expanduser(self.directory))
+                    proc_cwd = os.path.normpath(process.cwd())
+                    if proc_cwd != expected_dir:
+                        self.pid = None
+                        return False
+
+                # Get base command name
                 base_command = self.command.split()[0]
                 base_name = os.path.basename(base_command)
-                
+
+                # Verify it's the correct process
                 if base_name.endswith('.py'):
-                    return 'python' in process.name().lower() and any(base_name in cmd for cmd in process.cmdline())
+                    is_correct_process = ('python' in process.name().lower() and 
+                                        any(base_name == os.path.basename(cmd) for cmd in cmdline))
                 else:
-                    return base_name.lower() in process.name().lower()
+                    is_correct_process = base_name.lower() == process.name().lower()
+
+                if not is_correct_process:
+                    self.pid = None
+                    return False
+
+                return True
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                self.pid = None
+                return False
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            self.pid = None
             return False
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except Exception as e:
+            console.print(f"Error checking running status for {self.name}: {str(e)}", style=ERROR_STYLE)
+            self.pid = None
             return False
 
     def get_status(self):
@@ -246,7 +306,6 @@ class DevEnvironment:
                     progress.update(task, description=f"Waiting {service.delay}s before starting {service_name}...")
                     time.sleep(service.delay)
 
-                # Convert forward slashes to backslashes for Windows and ensure paths exist
                 working_dir = None
                 if service.directory:
                     working_dir = os.path.normpath(os.path.expanduser(service.directory))
@@ -256,61 +315,54 @@ class DevEnvironment:
                 
                 if sys.platform == 'win32':
                     if service.venv:
-                        # Look for venv in the project directory
-                        venv_path = os.path.join(os.path.normpath(service.venv), 'venv')
+                        venv_path = os.path.join(os.path.normpath(os.path.expanduser(service.venv)), 'venv')
                         activate_script = os.path.join(venv_path, 'Scripts', 'activate.ps1')
                         
                         if not os.path.exists(activate_script):
                             raise FileNotFoundError(f"Virtual environment activation script not found: {activate_script}")
                         
-                        # Create PowerShell script for venv activation
+                        # Create PowerShell script with error handling
                         ps_content = f"""
-Set-Location "{working_dir}"
-& "{activate_script}"
-{service.command}
-pause
+$ErrorActionPreference = 'Stop'
+try {{
+    Set-Location "{working_dir}"
+    & "{activate_script}"
+    {service.command}
+}} catch {{
+    Write-Host "Error: $_"
+    pause
+}}
                         """.strip()
                         
                         ps_path = os.path.join(os.getcwd(), f"{service_name}_launcher.ps1")
-                        console.print(f"Creating PowerShell script: {ps_path}", style="blue")
-                        console.print(f"Activation script path: {activate_script}", style="blue")
-                        
                         with open(ps_path, 'w') as f:
                             f.write(ps_content)
                         
-                        console.print(f"PowerShell script contents:\n{ps_content}", style="blue")
-                        
+                        # Start PowerShell with proper arguments
                         process = subprocess.Popen(
                             ["powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", ps_path],
-                            creationflags=subprocess.CREATE_NEW_CONSOLE
+                            cwd=working_dir,
+                            creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
                         )
+                        
                     elif service.is_exe():
-                        exe_path = os.path.normpath(service.get_exe_path())
+                        exe_path = service.get_exe_path()
                         if not os.path.exists(exe_path):
                             raise FileNotFoundError(f"Executable not found: {exe_path}")
                         
-                        batch_content = f"""
-@echo off
-cd /d "{working_dir or os.path.dirname(exe_path)}"
-start "" "{exe_path}"
-                        """.strip()
-                        
-                        batch_path = os.path.join(os.getcwd(), f"{service_name}_launcher.bat")
-                        with open(batch_path, 'w') as f:
-                            f.write(batch_content)
-                        
                         process = subprocess.Popen(
-                            batch_path,
-                            shell=True,
-                            creationflags=subprocess.CREATE_NEW_CONSOLE
+                            exe_path,
+                            cwd=working_dir or os.path.dirname(exe_path),
+                            creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
                         )
+                        
                     else:
                         # For non-venv, non-exe commands
                         batch_content = f"""
 @echo off
 cd /d "{working_dir}"
 {service.command}
-pause
+if errorlevel 1 pause
                         """.strip()
                         
                         batch_path = os.path.join(os.getcwd(), f"{service_name}_launcher.bat")
@@ -319,14 +371,15 @@ pause
                         
                         process = subprocess.Popen(
                             batch_path,
+                            cwd=working_dir,
                             shell=True,
-                            creationflags=subprocess.CREATE_NEW_CONSOLE
+                            creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
                         )
                     
-                    # Store process info and wait briefly to check if it started
+                    # Store process info and wait to verify it started
                     service.process = process
                     service.pid = process.pid
-                    time.sleep(1)  # Wait a moment to check if process is running
+                    time.sleep(2)  # Wait longer to ensure process starts
 
                     # Verify process is running
                     if service.is_running():
@@ -335,17 +388,16 @@ pause
                         return True
                     else:
                         service.status = "stopped"
+                        service.pid = None
                         progress.update(task, description=f"❌ Failed to start {service_name}")
                         return False
-                    
-                else:
-                    # Unix-like systems handling...
-                    pass
 
             except Exception as e:
                 console.print(Panel(f"Error starting {service_name}: {str(e)}\nDirectory: {service.directory}\nCommand: {service.command}", 
                                 style="red",
                                 box=box.ROUNDED))
+                service.status = "stopped"
+                service.pid = None
                 return False
 
     def list_services(self):
