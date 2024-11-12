@@ -1,0 +1,25 @@
+# Ignore everything
+*
+
+# But don't ignore these files
+!.gitignore
+!srv.py
+!README.md
+!requirements.txt
+
+# Don't ignore the prrot directory and its contents
+!prrot/
+!prrot/*
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore virtual environment
+venv/
+.env
+
+# Ignore configuration files
+devenv_config.yaml
+*.config
